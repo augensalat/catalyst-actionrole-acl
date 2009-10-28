@@ -2,8 +2,7 @@ package Catalyst::ActionRole::ACL;
 use Moose::Role;
 use namespace::autoclean;
 
-use vars qw($VERSION);
-$VERSION = '0.05'; # REMEMBER TO BUMP VERSION IN Action::Role::ACL ALSO!
+our $VERSION = '0.06'; # REMEMBER TO BUMP VERSION IN Action::Role::ACL ALSO!
 
 =head1 NAME
 
@@ -30,8 +29,8 @@ Catalyst::ActionRole::ACL - User role-based authorization action class
  sub denied :Private {
      my ($self, $c) = @_;
 
-     $c->res->status('403');
-     $c->res->body('Denied!');
+     $c->res->status = '403';
+     $c->body('Denied!');
  }
 
 =head1 DESCRIPTION
@@ -52,20 +51,39 @@ The name of an action to which the request should be detached if it is
 determined that ACLs are not satisfied for this user and the resource he
 is attempting to access.
 
-=head2 RequiresRole and AllowedRole
+=head2 RequiresRole, AllowedRole and ACLRule
 
 The action must include at least one of these attributes, otherwise the Role::ACL
 constructor will throw an exception.
 
 =head1 Processing of ACLs
 
-One or more roles may be associated with an action.
+One or more roles or rules may be associated with an action.
 
 User roles are fetched via the invocation of the context "user" object's "roles"
 method.
 
 Roles specified with the RequiresRole attribute are checked before roles
 specified with the AllowedRole attribute.
+
+Rules are a more flexible concept than the static roles evaluation. Access
+control is delegated to controller methods. Rules are processed in the given
+order, but before any roles. Each rule can decide to terminate the processing
+chain by returning C<ALLOW> or C<DENY>. If even the last rule did not return
+C<ALLOW> or C<DENY> access is granted if no roles are defined, otherwise roles
+are checked as described above.
+
+Rule controller methods are given three (besides C<$self>) arguments:
+
+=over
+
+=item * The well known context C<$c>.
+
+=item * The L<action|Catalyst::Action> to which this rule was applied.
+
+=item * A hash reference with the user's roles as keys and values set to C<1>.
+
+=back
 
 The mandatory ACLDetachTo attribute specifies the name of the action to which
 execution will detach on access violation.
@@ -88,8 +106,8 @@ access is denied to one of the actions in the chain by its ACL.
  }
 
  This action will cause an exception because it's missing the ACLDetachTo attribute
- and has neither a RequiresRole nor an AllowedRole attribute. A Role::ACL action
- must include at least one RequiresRole or AllowedRole attribute.
+ and has neither a RequiresRole, AllowedRole nor an ACLRule attribute. A Role::ACL
+ action must include at least one RequiresRole, AllowedRole or ACLRule attribute.
 
  sub foo
  :Local
@@ -129,6 +147,30 @@ either the 'editor' or 'writer' role (or both).
 
 Any user with either the 'admin' or 'user' role may execute this action.
 
+ sub edit :Local
+ :Does(ACL)
+ :ACLRule(assert_can_edit)
+ :ACLDetachTo(denied)
+ {
+     my ($self, $c) = @_;
+     ...
+ }
+
+ sub assert_can_edit :Private {
+     my ($self, $c, $action, $roles) = @_;
+
+     return 'ALLOW' if $roles->{admin}
+     return 'DENY'  unless $roles->{editor}
+     return 'DENY'
+         unless $c->stash->{this}->writable_for($c->user);
+     return 'CONTINUE';
+ }
+
+Admins can always edit everything, otherwise user must be an editor.
+Eventually the object ("this") defines if editor has write access.
+The final C<'CONTINUE'> is just to demonstrate, that access control
+is delegated to any subsequent rule or role checking.
+
 =head1 WRAPPED METHODS
 
 =cut
@@ -147,9 +189,13 @@ after BUILD => sub {
 
     my $attr = $args->{attributes};
 
-    unless (exists $attr->{RequiresRole} || exists $attr->{AllowedRole}) {
+    unless (
+	exists $attr->{RequiresRole} ||
+	exists $attr->{AllowedRole} ||
+	exists $attr->{ACLRule}
+    ) {
         Catalyst::Exception->throw(
-            "Action '$args->{reverse}' requires at least one RequiresRole or AllowedRole attribute");
+            "Action '$args->{reverse}' requires at least one ACLRule, RequiresRole or AllowedRole attribute");
     }
     unless (exists $attr->{ACLDetachTo} && $attr->{ACLDetachTo}) {
         Catalyst::Exception->throw(
@@ -195,42 +241,66 @@ a given action.
 
 sub can_visit {
     my ($self, $c) = @_;
-
     my $user = $c->user;
 
     return unless $user;
 
-    return unless
-        $user->supports('roles') && $user->can('roles');
+    my %user_has;
 
-    my %user_has = map {$_,1} $user->roles;
+    %user_has = map {$_,1} $user->roles
+	if $user->supports('roles') && $user->can('roles');
 
-    my $required = $self->attributes->{RequiresRole};
-    my $allowed = $self->attributes->{AllowedRole};
+    my $attr = $self->attributes;
+    my $rules = $attr->{ACLRule};
+
+    my $rc;
+    if ($rules) {
+	for my $rule (@$rules) {
+	    $rc = $c->forward($rule, [$self, \%user_has]) || '';
+	    # Terminate access control chain if we get an explicit
+	    # return value ("ALLOW" or "DENY").
+	    return 1
+		if $rc eq 'ALLOW';
+	    return ''
+		if $rc eq 'DENY';
+	}
+    }
+
+    my $required = $attr->{RequiresRole};
+    my $allowed = $attr->{AllowedRole};
+
+    # Return success if now ACLRule denied access and no RequiresRole or
+    # AllowedRole attribute is set.
+    return 1
+	unless $required or $allowed;
 
     if ($required && $allowed) {
         for my $role (@$required) {
-            return unless $user_has{$role};
+            return ''
+		unless $user_has{$role};
         }
         for my $role (@$allowed) {
-            return 1 if $user_has{$role};
+            return 1
+		if $user_has{$role};
         }
-        return;
+        return '';
     }
     elsif ($required) {
         for my $role (@$required) {
-            return unless $user_has{$role};
+            return ''
+		unless $user_has{$role};
         }
         return 1;
     }
     elsif ($allowed) {
         for my $role (@$allowed) {
-            return 1 if $user_has{$role};
+            return 1
+		if $user_has{$role};
         }
-        return;
+        return '';
     }
 
-    return;
+    return '';
 }
 
 1;
